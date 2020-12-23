@@ -28,7 +28,7 @@ from resnet import ResNet32,VNet
 from load_corrupted_data import CIFAR10, CIFAR100
 
 parser = argparse.ArgumentParser(description='PyTorch WideResNet Training')
-parser.add_argument('--dataset', default='cifar10', type=str,
+parser.add_argument('--dataset', default='cifar100', type=str,
                     help='dataset (cifar10 [default] or cifar100)')
 parser.add_argument('--corruption_prob', type=float, default=0.4,
                     help='label noise')
@@ -68,7 +68,7 @@ parser.add_argument('--prefetch', type=int, default=0, help='Pre-fetching thread
 parser.set_defaults(augment=True)
 
 args = parser.parse_args()
-use_cuda = True
+use_cuda = False
 torch.manual_seed(args.seed)
 device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -102,22 +102,22 @@ def build_dataset():
 
     if args.dataset == 'cifar10':
         train_data_meta = CIFAR10(
-            root='../data', train=True, meta=True, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
-            corruption_type=args.corruption_type, transform=train_transform, download=True)
+            root='../../data/raw', train=True, meta=True, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
+            corruption_type=args.corruption_type, transform=train_transform, download=False)
         train_data = CIFAR10(
-            root='../data', train=True, meta=False, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
+            root='../../data/raw', train=True, meta=False, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
             corruption_type=args.corruption_type, transform=train_transform, download=True, seed=args.seed)
-        test_data = CIFAR10(root='../data', train=False, transform=test_transform, download=True)
+        test_data = CIFAR10(root='../../data/raw', train=False, transform=test_transform, download=False)
 
 
     elif args.dataset == 'cifar100':
         train_data_meta = CIFAR100(
-            root='../data', train=True, meta=True, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
+            root='../../data/raw', train=True, meta=True, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
             corruption_type=args.corruption_type, transform=train_transform, download=True)
         train_data = CIFAR100(
-            root='../data', train=True, meta=False, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
+            root='../../data/raw', train=True, meta=False, num_meta=args.num_meta, corruption_prob=args.corruption_prob,
             corruption_type=args.corruption_type, transform=train_transform, download=True, seed=args.seed)
-        test_data = CIFAR100(root='../data', train=False, transform=test_transform, download=True)
+        test_data = CIFAR100(root='../../data/raw', train=False, transform=test_transform, download=False)
 
 
     train_loader = torch.utils.data.DataLoader(
@@ -197,31 +197,36 @@ def train(train_loader,train_meta_loader,model, vnet,optimizer_model,optimizer_v
     for batch_idx, (inputs, targets) in enumerate(train_loader):
         model.train()
         inputs, targets = inputs.to(device), targets.to(device)
-        meta_model = build_model().cuda()
+        meta_model = build_model().cuda() if torch.cuda.is_available() else build_model()
         meta_model.load_state_dict(model.state_dict())
-        outputs = meta_model(inputs)
+        outputs = meta_model(inputs) # outputs : (100, 10), inputs : (100, 3, 32, 32)
 
-        cost = F.cross_entropy(outputs, targets, reduce=False)
-        cost_v = torch.reshape(cost, (len(cost), 1))
-        v_lambda = vnet(cost_v.data)
-        l_f_meta = torch.sum(cost_v * v_lambda)/len(cost_v)
+        cost = F.cross_entropy(outputs, targets, reduce=False) # 100
+        cost_v = torch.reshape(cost, (len(cost), 1)) # (100, 1)
+        v_lambda = vnet(cost_v.data) # (100, 1)
+        l_f_meta = torch.sum(cost_v * v_lambda)/len(cost_v) #
         meta_model.zero_grad()
-        grads = torch.autograd.grad(l_f_meta, (meta_model.params()), create_graph=True)
+        grads = torch.autograd.grad(l_f_meta, (meta_model.params()), create_graph=True) # 95 : 5 + (5+5+5)*(1+2+1+2)
         meta_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))   # For ResNet32
         meta_model.update_params(lr_inner=meta_lr, source_params=grads)
         del grads
 
         try:
             inputs_val, targets_val = next(train_meta_loader_iter)
+            # inputs_val  : 100,3,32,32
+            # targets_val : 100
         except StopIteration:
             train_meta_loader_iter = iter(train_meta_loader)
             inputs_val, targets_val = next(train_meta_loader_iter)
         inputs_val, targets_val = inputs_val.to(device), targets_val.to(device)
-        y_g_hat = meta_model(inputs_val)
-        l_g_meta = F.cross_entropy(y_g_hat, targets_val)
+        y_g_hat = meta_model(inputs_val) # (100, 100)
+        l_g_meta = F.cross_entropy(y_g_hat, targets_val) #
         prec_meta = accuracy(y_g_hat.data, targets_val.data, topk=(1,))[0]
 
 
+
+        import copy
+        prev = copy.deepcopy(list(vnet.params()))
         optimizer_vnet.zero_grad()
         l_g_meta.backward()
         optimizer_vnet.step()
@@ -245,23 +250,24 @@ def train(train_loader,train_meta_loader,model, vnet,optimizer_model,optimizer_v
         meta_loss += l_g_meta.item()
 
 
-        if (batch_idx + 1) % 50 == 0:
-            print('Epoch: [%d/%d]\t'
-                  'Iters: [%d/%d]\t'
-                  'Loss: %.4f\t'
-                  'MetaLoss:%.4f\t'
-                  'Prec@1 %.2f\t'
-                  'Prec_meta@1 %.2f' % (
-                      (epoch + 1), args.epochs, batch_idx + 1, len(train_loader.dataset)/args.batch_size, (train_loss / (batch_idx + 1)),
-                      (meta_loss / (batch_idx + 1)), prec_train, prec_meta))
+        # if (batch_idx + 1) % 50 == 0:
+        print('Epoch: [%d/%d]\t'
+              'Iters: [%d/%d]\t'
+              'Loss: %.4f\t'
+              'MetaLoss:%.4f\t'
+              'Prec@1 %.2f\t'
+              'Prec_meta@1 %.2f' % (
+                  (epoch + 1), args.epochs, batch_idx + 1, len(train_loader.dataset)/args.batch_size, (train_loss / (batch_idx + 1)),
+                  (meta_loss / (batch_idx + 1)), prec_train, prec_meta))
 
 
 
 
 train_loader, train_meta_loader, test_loader = build_dataset()
+
 # create model
 model = build_model()
-vnet = VNet(1, 100, 1).cuda()
+vnet = VNet(1, 100, 1).cuda() if torch.cuda.is_available() else VNet(1,100,1)
 
 if args.dataset == 'cifar10':
     num_classes = 10
