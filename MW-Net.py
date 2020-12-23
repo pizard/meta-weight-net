@@ -68,9 +68,8 @@ parser.add_argument('--prefetch', type=int, default=0, help='Pre-fetching thread
 parser.set_defaults(augment=True)
 
 args = parser.parse_args()
-use_cuda = False
 torch.manual_seed(args.seed)
-device = torch.device("cuda" if use_cuda else "cpu")
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 print()
